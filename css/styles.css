@@ -849,9 +849,12 @@ body.brush .daycell:not(.empty) {
 }
 
 .dlg {
-    width: min(460px, 100%);
-    max-height: calc(100dvh - 32px);
+    box-sizing: border-box;
+    width: min(460px, calc(100vw - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px) - 32px));
+    max-height: calc(100vh - 32px);
+    max-height: calc(100dvh - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px) - 24px);
     overflow: auto;
+    overscroll-behavior: contain;
     background: var(--panel);
     color: var(--ink);
     border: 1px solid var(--line);
@@ -872,7 +875,8 @@ body.brush .daycell:not(.empty) {
 .dlg p {
     margin: 0 0 18px;
     color: var(--muted);
-    line-height: 1.5
+    line-height: 1.5;
+    overflow-wrap: anywhere
 }
 
 .dact {
@@ -886,7 +890,9 @@ body.brush .daycell:not(.empty) {
     background: var(--soft);
     color: var(--ink);
     border: 1px solid var(--line);
-    text-align: center
+    text-align: center;
+    white-space: normal;
+    overflow-wrap: anywhere
 }
 
 .dact button.primary {
@@ -1197,6 +1203,16 @@ body.brush .daycell:not(.empty) {
 
 /* ===== Adaptación móvil (solo pantallas estrechas; escritorio e impresión no cambian) ===== */
 @media screen and (max-width: 700px) {
+    .dlg {
+        width: calc(100vw - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px) - 24px);
+        max-height: calc(100dvh - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px) - 24px);
+        padding: 18px
+    }
+
+    .progress-dialog {
+        width: min(420px, calc(100vw - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px) - 24px))
+    }
+
     html {
         -webkit-text-size-adjust: 100%;
         text-size-adjust: 100%
@@ -1254,10 +1270,6 @@ body.brush .daycell:not(.empty) {
     .actions {
         width: 100%;
         gap: 6px
-    }
-
-    .actions #connectBtn {
-        flex-basis: 100%
     }
 
     .actions #exportBtn, .actions #discardBtn {
@@ -1479,10 +1491,6 @@ body.brush .daycell:not(.empty) {
     line-height: 1.5
 }
 
-.progress-dialog {
-    text-align: center
-}
-
 .progress-dialog progress {
     display: block;
     width: 100%;
@@ -1491,7 +1499,12 @@ body.brush .daycell:not(.empty) {
     accent-color: var(--accent)
 }
 
-.progress-dialog[open] {
+.progress-dialog {
+    width: min(420px, calc(100vw - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px) - 32px));
+    text-align: center
+}
+
+.progress-dialog[open], .connect-dialog[open] {
     position: fixed;
     inset: 50% auto auto 50%;
     margin: 0;

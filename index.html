@@ -39,7 +39,6 @@
             </button>
         </div>
         <div class="actions">
-            <button type="button" id="connectBtn">Conectar con Google Drive</button>
             <button class="primary" id="exportBtn" disabled>Guardar</button>
             <button type="button" id="discardBtn" disabled
                     title="Descartar los cambios y recargar los datos del archivo">Descartar cambios
@@ -57,6 +56,7 @@
                     <button id="printBtn" type="button" role="menuitem">Imprimir</button>
                     <button id="bkBtn" type="button" role="menuitem" disabled>Crear copia en Drive</button>
                     <button id="selBtn" type="button" role="menuitem" disabled>Recargar desde Drive</button>
+                    <button id="connectBtn" type="button" role="menuitem">Conectar con Google Drive</button>
                     <button id="disconnectBtn" type="button" role="menuitem" disabled>Desconectar cuenta</button>
                     <hr>
                     <button class="danger" id="resetBtn" type="button" role="menuitem">Restablecer este año</button>
@@ -137,6 +137,14 @@
     <h3 id="progressTitle">Un momento</h3>
     <p id="progressMessage">Conectando con Google Drive…</p>
     <progress aria-label="Operación en curso"></progress>
+</dialog>
+<dialog id="connectDialog" class="dlg connect-dialog" aria-labelledby="connectTitle" aria-describedby="connectMessage">
+    <h3 id="connectTitle">Conectar con Google Drive</h3>
+    <p id="connectMessage">Elige la cuenta de Google que guardarás para esta jornada.</p>
+    <div class="dact">
+        <button id="connectContinue" class="primary" type="button">Continuar con Google</button>
+        <button id="connectCancel" type="button">Ahora no</button>
+    </div>
 </dialog>
 <dialog id="holidayDialog" class="holiday-dialog" aria-labelledby="holidayTitle">
     <h3 id="holidayTitle">Importar festivos</h3>

@@ -374,27 +374,25 @@ function setStatus() {
     b.title = 'Guardar en Google Drive (Ctrl/Cmd+S)';
     $('connectBtn').disabled = busy;
     var connected = JornadaDrive.connected(), connectBtn = $('connectBtn');
+    connectBtn.setAttribute('role', 'menuitem');
     if (loaded && connected) {
         connectBtn.textContent = 'Cambiar cuenta';
         connectBtn.title = 'Elegir otra cuenta de Google Drive';
-        connectBtn.setAttribute('role', 'menuitem');
-        $('moreMenu').insertBefore(connectBtn, $('disconnectBtn'))
     } else {
         connectBtn.textContent = connected ? 'Abrir mi jornada' :
             account ? 'Reconectar con Drive' : 'Conectar con Google Drive';
         connectBtn.title = account && account.email ? 'Cuenta recordada: ' + account.email : '';
-        connectBtn.removeAttribute('role');
-        $('exportBtn').parentNode.insertBefore(connectBtn, $('exportBtn'))
     }
     $('disconnectBtn').disabled = busy || !account;
-    ['moreBtn', 'printBtn', 'selBtn', 'bkBtn', 'resetBtn', 'holidayBtn', 'year', 'yPrev', 'yNext'].forEach(function (id) {
+    $('moreBtn').disabled = busy;
+    ['printBtn', 'selBtn', 'bkBtn', 'resetBtn', 'holidayBtn', 'year', 'yPrev', 'yNext'].forEach(function (id) {
         if ($(id)) $(id).disabled = !loaded || busy
     });
     document.querySelector('main').inert = !loaded || busy;
     var progressDialog = $('progressDialog');
     if (busy) {
         $('progressMessage').textContent = progressMessage || 'Conectando con Google Drive…';
-        if (!progressDialog.open) progressDialog.show()
+        if (!progressDialog.open) progressDialog.showModal()
     } else if (progressDialog.open) progressDialog.close()
 }
 
@@ -491,7 +489,7 @@ async function runDrive(action, message) {
                 driveError(recoveryError)
             }
         } else if (e.code === 'silent_auth') {
-            toast('No se pudo reconectar automáticamente. Pulsa «Reconectar con Drive» para continuar.')
+            toast('No se pudo reconectar automáticamente. Abre «Más opciones» y pulsa «Reconectar con Drive» para continuar.')
         } else driveError(e);
         return false
     } finally {
@@ -654,7 +652,7 @@ function resetSession() {
 
 async function conectar(silent) {
     if (busy) return;
-    var selectAccount = false;
+    var selectAccount = !account;
     if (!JornadaDrive.ready()) {
         if (silent === true) return false;
         toast('Google no está disponible todavía. Comprueba internet o el bloqueo de scripts y vuelve a pulsar Conectar.');
@@ -695,7 +693,31 @@ async function conectar(silent) {
     }, silent === true ? 'Restaurando tu sesión de Google Drive…' : 'Conectando con Google Drive…')
 }
 
-$('connectBtn').onclick = conectar;
+function openConnectDialog() {
+    var dialog = $('connectDialog');
+    if (dialog.open) return;
+    $('connectTitle').textContent = account ? 'Reconectar con Google Drive' : 'Conectar con Google Drive';
+    $('connectMessage').textContent = account ?
+        (account.email ? 'Se volverá a usar la cuenta ' + account.email + '.' :
+            'Se volverá a usar la cuenta de Google que seleccionaste anteriormente.') :
+        'Elige la cuenta de Google que guardarás para esta jornada.';
+    $('connectContinue').textContent = account ? 'Reconectar con Google' : 'Continuar con Google';
+    dialog.showModal();
+    $('connectContinue').focus()
+}
+
+$('connectBtn').onclick = function () {
+    closeMore();
+    if (JornadaDrive.connected()) conectar(false);
+    else openConnectDialog()
+};
+$('connectContinue').onclick = function () {
+    $('connectDialog').close();
+    conectar(false)
+};
+$('connectCancel').onclick = function () {
+    $('connectDialog').close()
+};
 $('disconnectBtn').onclick = async function () {
     if (busy || !(await resolvePending()) || !clearDraft()) return;
     resetSession();
@@ -1236,7 +1258,8 @@ window.addEventListener('storage', function (e) {
 });
 init().then(function () {
     var restore = function () {
-        if (account && !JornadaDrive.connected()) conectar(true)
+        if (account && !JornadaDrive.connected()) conectar(true);
+        else if (!account) openConnectDialog()
     };
     if (document.readyState === 'complete') restore();
     else window.addEventListener('load', restore, {once: true})
