@@ -12,7 +12,9 @@ function fresh() {
 }
 
 var S = fresh();
-var DB = {version: 3, years: {}}, fh = null, dirty = false, baseMtime = null, DRAFT = 'jornada_draft_v3';
+var DB = {version: 3, years: {}}, dirty = false, account = null, remote = null,
+    busy = false, editVersion = 0, draftWarning = false,
+    draftOwner = Date.now() + ':' + Math.random(), progressMessage = '';
 
 function normalize(o, y) {
     var r = Object.assign(fresh(), o || {});
@@ -51,20 +53,12 @@ function serialize() {
     return JSON.stringify(o)
 }
 
-var y0 = new Date().getFullYear();
-try {
-    y0 = +localStorage.getItem('jornada_last') || y0
-} catch (e) {
-}
-S = yearObj(y0);
+S = yearObj(new Date().getFullYear());
 
 function save() {
-    try {
-        localStorage.setItem('jornada_last', S.year);
-        localStorage.setItem(DRAFT, JSON.stringify({t: Date.now(), text: serialize()}))
-    } catch (e) {
-    }
     dirty = true;
+    editVersion++;
+    persistDraft();
     setStatus()
 }
 
@@ -174,10 +168,6 @@ $('year').addEventListener('change', function () {
         return
     }
     S = yearObj(y);
-    try {
-        localStorage.setItem('jornada_last', y)
-    } catch (e) {
-    }
     syncInputs();
     renderCalendar();
     calculate()
@@ -260,9 +250,7 @@ $('printBtn').onclick = function () {
     window.print()
 };
 
-var FNAME = 'jornada_laboral.json',
-    TYPES = [{description: 'Datos de jornada (JSON)', accept: {'application/json': ['.json']}}],
-    canFS = !!(window.showSaveFilePicker && window.showOpenFilePicker), RTXT = 'Restablecer este año';
+var RTXT = 'Restablecer este año';
 
 function esc(s) {
     return String(s).replace(/[&<>"]/g, function (c) {
@@ -270,90 +258,111 @@ function esc(s) {
     })
 }
 
-function idb() {
-    return new Promise(function (res, rej) {
-        var r = indexedDB.open('jornada_fs', 1);
-        r.onupgradeneeded = function () {
-            r.result.createObjectStore('h')
-        };
-        r.onsuccess = function () {
-            res(r.result)
-        };
-        r.onerror = function () {
-            rej(r.error)
-        }
-    })
+function draftKey(file) {
+    file = file || remote;
+    return account && file ? 'jornada_drive_v1:' + account.id + ':' + file.file.id : null
 }
 
-function hput(h, k) {
-    k = k || 'fh_all';
-    return idb().then(function (db) {
-        return new Promise(function (res) {
-            var t = db.transaction('h', 'readwrite');
-            if (h) t.objectStore('h').put(h, k); else t.objectStore('h').delete(k);
-            t.oncomplete = res;
-            t.onerror = res
-        })
-    }).catch(function () {
-    })
-}
-
-function hget(k) {
-    k = k || 'fh_all';
-    return idb().then(function (db) {
-        return new Promise(function (res) {
-            var q = db.transaction('h').objectStore('h').get(k);
-            q.onsuccess = function () {
-                res(q.result || null)
-            };
-            q.onerror = function () {
-                res(null)
-            }
-        })
-    }).catch(function () {
-        return null
-    })
-}
-
-function readDraft() {
+function readDraft(file) {
+    var key = draftKey(file);
+    if (!key) return null;
     try {
-        var d = JSON.parse(localStorage.getItem(DRAFT) || 'null');
-        return d && d.text ? d : null
+        var d = JSON.parse(localStorage.getItem(key) || 'null');
+        return d && d.text && d.account === account.id && d.file === file.file.id ? d : null
     } catch (e) {
+        draftWarning = true;
+        toast('No se puede leer el borrador de recuperación de este navegador.');
         return null
     }
 }
 
-function clearDraft() {
+function persistDraft(takeOwnership) {
+    var key = draftKey();
+    if (!key) return;
     try {
-        localStorage.removeItem(DRAFT)
+        var existing = localStorage.getItem(key);
+        if (existing && JSON.parse(existing).owner !== draftOwner && !takeOwnership) {
+            draftWarning = true;
+            toast('Hay un borrador de otra pestaña. No lo reemplazaremos. Guarda en Drive antes de cerrar esta pestaña.');
+            return
+        }
+        localStorage.setItem(key, JSON.stringify({
+            account: account.id, file: remote.file.id, base: remote.file.version,
+            owner: draftOwner, t: Date.now(), year: S.year, text: serialize()
+        }));
+        draftWarning = false
     } catch (e) {
+        draftWarning = true;
+        toast('No se pudo conservar el borrador. Mantén esta pestaña abierta y guarda en Drive.')
+    }
+}
+
+function clearDraft(file, discardRecovered) {
+    var key = draftKey(file);
+    if (!key) return true;
+    try {
+        var existing = localStorage.getItem(key);
+        if (existing && JSON.parse(existing).owner !== draftOwner && !discardRecovered) return true;
+        localStorage.removeItem(key);
+        draftWarning = false;
+        return true
+    } catch (e) {
+        draftWarning = true;
+        toast('No se pudo borrar el borrador del navegador. No desconectes en un dispositivo compartido.');
+        return false
     }
 }
 
 function setStatus() {
-    var b = $('exportBtn'), dc = $('discardBtn');
+    var b = $('exportBtn'), dc = $('discardBtn'), loaded = !!remote;
     if (!b) return;
-    if (dc) dc.disabled = !dirty;
-    b.textContent = dirty ? 'Guardar •' : 'Guardar';
+    if (dc) dc.disabled = !loaded || !dirty || busy;
+    b.disabled = !loaded || busy || !dirty;
+    b.textContent = busy ? 'Espera…' : dirty ? 'Guardar •' : 'Guardar';
     b.classList.toggle('dirty', dirty);
-    b.title = (fh ? 'Guardar en ' + fh.name : 'Guardar') + ' (Ctrl+S)';
+    b.title = 'Guardar en Google Drive (Ctrl/Cmd+S)';
+    $('connectBtn').disabled = busy;
+    var connected = JornadaDrive.connected(), connectBtn = $('connectBtn');
+    if (loaded && connected) {
+        connectBtn.textContent = 'Cambiar cuenta';
+        connectBtn.setAttribute('role', 'menuitem');
+        $('moreMenu').insertBefore(connectBtn, $('disconnectBtn'))
+    } else {
+        connectBtn.textContent = connected ? 'Abrir mi jornada' :
+            account ? 'Reconectar con Drive' : 'Conectar con Google Drive';
+        connectBtn.removeAttribute('role');
+        $('exportBtn').parentNode.insertBefore(connectBtn, $('exportBtn'))
+    }
+    $('disconnectBtn').disabled = busy || !account;
+    ['moreBtn', 'printBtn', 'selBtn', 'bkBtn', 'resetBtn', 'holidayBtn', 'year', 'yPrev', 'yNext'].forEach(function (id) {
+        if ($(id)) $(id).disabled = !loaded || busy
+    });
+    document.querySelector('main').inert = !loaded || busy;
+    var progressDialog = $('progressDialog');
+    if (busy) {
+        $('progressMessage').textContent = progressMessage || 'Conectando con Google Drive…';
+        if (!progressDialog.open) progressDialog.show()
+    } else if (progressDialog.open) progressDialog.close()
 }
 
 function modal(o) {
     return new Promise(function (res) {
-        var ov = document.createElement('div');
-        ov.id = 'ov';
-        ov.innerHTML = '<div class="dlg" role="dialog" aria-modal="true"><h3>' + o.title + '</h3><p>' + o.text + '</p><div class="dact">' + o.actions.map(function (a, i) {
+        var ov = document.createElement('dialog');
+        ov.className = 'dlg';
+        ov.setAttribute('aria-label', o.title);
+        ov.innerHTML = '<h3>' + o.title + '</h3><p>' + o.text + '</p><div class="dact">' + o.actions.map(function (a, i) {
             return '<button type="button" data-i="' + i + '" class="' + (a.cls || '') + '">' + a.label + '</button>'
-        }).join('') + '</div></div>';
+        }).join('') + '</div>';
+        ov.addEventListener('cancel', function (e) { e.preventDefault() });
         ov.addEventListener('click', function (e) {
             var b = e.target.closest('button');
             if (!b) return;
+            ov.close();
             ov.remove();
             res(o.actions[+b.dataset.i].v)
         });
         document.body.appendChild(ov);
+        ov.showModal();
         var f = ov.querySelector('button');
         if (f) f.focus()
     })
@@ -367,255 +376,268 @@ function showYear() {
     setStatus()
 }
 
-async function loadFrom(h, ask) {
-    var f = await h.getFile(), db = parseDB(await f.text());
-    fh = h;
-    DB = db;
-    baseMtime = f.lastModified;
-    dirty = false;
-    var d = readDraft();
-    if (ask && d) {
+function setProgress(message) {
+    progressMessage = message;
+    if (busy) $('progressMessage').textContent = message
+}
+
+async function loadRemote(id, recover) {
+    setProgress('Cargando tu jornada desde Google Drive…');
+    var next = await JornadaDrive.read(id), db = parseDB(next.text);
+    var d = recover ? readDraft(next) : null, restored = false;
+    if (d) {
         var r = await modal({
             title: 'Cambios sin guardar',
-            text: 'La última vez cerraste con cambios sin guardar (' + new Date(d.t).toLocaleString('es-ES') + '). ¿Quieres recuperarlos?',
-            actions: [{v: 'rec', label: 'Recuperar mis cambios', cls: 'primary'}, {
-                v: 'no',
-                label: 'Descartarlos y usar el archivo'
-            }]
+            text: 'Hay un borrador de esta cuenta y archivo (' + esc(new Date(d.t).toLocaleString('es-ES')) + '). ' +
+                (String(d.base) !== String(next.file.version) ?
+                    '<b>Drive ha cambiado desde ese borrador.</b> Recuperarlo mantendrá el conflicto pendiente hasta que decidas qué guardar.' :
+                    'Puedes recuperarlo y revisarlo antes de guardar.'),
+            actions: [{v: 'rec', label: 'Recuperar borrador', cls: 'primary'},
+                {v: 'no', label: 'Descartar borrador y usar Drive', cls: 'danger'}]
         });
         if (r === 'rec') {
-            try {
-                DB = parseDB(d.text);
-                dirty = true
-            } catch (e) {
-                clearDraft()
-            }
-        } else clearDraft()
-    } else clearDraft();
+            db = parseDB(d.text);
+            next = {file: Object.assign({}, next.file, {version: d.base}), text: next.text};
+            S.year = d.year >= 2000 && d.year <= 2100 ? d.year : S.year;
+            restored = true
+        }
+    }
+    remote = next;
+    DB = db;
+    dirty = restored;
+    editVersion++;
+    if (restored) persistDraft(true);
+    else if (!recover || d) clearDraft(null, !!d);
     showYear()
 }
 
-function adoptDraft(d) {
-    try {
-        DB = parseDB(d.text);
-        dirty = true;
-        showYear();
-        toast('Recuperados cambios que no estaban guardados')
-    } catch (e) {
-        clearDraft()
-    }
+function driveError(e) {
+    toast(e.message || 'No se pudo completar la operación con Drive.')
 }
 
-async function writeFile() {
-    var w = await fh.createWritable();
-    await w.write(serialize());
-    await w.close();
-    baseMtime = (await fh.getFile()).lastModified;
-    dirty = false;
-    clearDraft();
+async function runDrive(action, message) {
+    if (busy) return false;
+    endPaint();
+    menu.style.display = 'none';
+    busy = true;
+    progressMessage = message || 'Conectando con Google Drive…';
     setStatus();
-    toast('Guardado en ' + fh.name)
-}
-
-function descargar() {
-    var b = new Blob([serialize()], {type: 'application/json'});
-    var a = document.createElement('a');
-    a.href = URL.createObjectURL(b);
-    a.download = FNAME;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(function () {
-        URL.revokeObjectURL(a.href)
-    }, 1000);
-    dirty = false;
-    clearDraft();
-    setStatus();
-    toast('Descargado como "' + FNAME + '". Guárdalo en tu carpeta de Drive y ábrelo la próxima vez con "Abrir otro archivo".')
-}
-
-async function crear() {
-    if (!canFS) {
-        descargar();
-        return true
-    }
-    var prev = fh;
     try {
-        var h = await showSaveFilePicker({suggestedName: FNAME, types: TYPES, id: 'jornada'});
-        fh = h;
-        await hput(h);
-        baseMtime = null;
-        await writeFile();
+        await action();
         return true
     } catch (e) {
-        fh = prev;
-        if (!(e && e.name === 'AbortError')) toast('No se pudo crear el archivo. Prueba con otra carpeta.');
+        if (e.code === 'missing' && remote && JornadaDrive.connected()) {
+            try {
+                await recreateMissing()
+            } catch (recoveryError) {
+                driveError(recoveryError)
+            }
+        } else driveError(e);
         return false
+    } finally {
+        busy = false;
+        setStatus()
     }
+}
+
+async function recreateMissing() {
+    var choice = await modal({
+        title: 'El archivo no está disponible',
+        text: 'Puede haberse eliminado o retirado el permiso. Conservaremos tus datos en esta pestaña. ' +
+            'Puedes reconectar o crear expresamente un archivo principal nuevo con los datos que ves.',
+        actions: [{v: 'cancel', label: 'Conservar datos y reconectar después', cls: 'primary'},
+            {v: 'new', label: 'Crear un nuevo archivo en esta cuenta de Drive'}]
+    });
+    if (choice !== 'new') return;
+    var files = await JornadaDrive.listMain();
+    if (files.length) {
+        throw Error('Ya existe una jornada en esta cuenta. Crea una copia en Drive de tus cambios antes de desconectar y volver a abrirla.')
+    }
+    var previous = remote, text = serialize(), file = await JornadaDrive.createMain(text);
+    var next = await JornadaDrive.read(file.id);
+    if (next.text !== text) throw Error('El nuevo archivo ha cambiado. Tus datos siguen en esta pestaña; crea una copia antes de reconectar.');
+    clearDraft(previous);
+    remote = next;
+    dirty = false;
+    toast('Creado un nuevo archivo con tu jornada en Google Drive')
 }
 
 async function guardar() {
-    if (!canFS) {
-        descargar();
-        return
+    if (!remote || busy) return false;
+    if (!dirty) return true;
+    if (!JornadaDrive.connected()) {
+        toast('Pulsa Conectar con Drive para renovar el permiso. Tus cambios siguen pendientes.');
+        return false
     }
-    if (!fh) {
-        await crear();
-        return
-    }
-    try {
-        var p = await fh.queryPermission({mode: 'readwrite'});
-        if (p !== 'granted' && (await fh.requestPermission({mode: 'readwrite'})) !== 'granted') {
-            toast('Sin permiso para escribir en el archivo');
-            return
-        }
-        var f = await fh.getFile();
-        if (baseMtime !== null && f.lastModified !== baseMtime) {
+    return runDrive(async function () {
+        var base = remote, meta = await JornadaDrive.metadata(remote.file.id);
+        if (String(meta.version) !== String(remote.file.version)) {
             var r = await modal({
-                title: 'El archivo ha cambiado',
-                text: 'Se modificó fuera de esta ventana (¿desde otro equipo?) después de que lo cargaras. Si lo sobrescribes, perderás esos cambios.',
-                actions: [{v: 'cancel', label: 'Cancelar', cls: 'primary'}, {
-                    v: 'load',
-                    label: 'Cargar el archivo y descartar mis cambios'
-                }, {v: 'over', label: 'Sobrescribir con mis cambios', cls: 'danger'}]
+                title: 'Drive ha cambiado',
+                text: 'Otra sesión ha modificado el archivo. No se sobrescribirá sin tu permiso. ' +
+                    'Puedes conservar tus cambios pendientes, cargar Drive o reemplazarlo expresamente.',
+                actions: [{v: 'cancel', label: 'Conservar mis cambios sin guardar', cls: 'primary'},
+                    {v: 'load', label: 'Descartar mis cambios y cargar Drive', cls: 'danger'},
+                    {v: 'over', label: 'Sobrescribir Drive con mis cambios', cls: 'danger'}]
             });
             if (r === 'load') {
-                await loadFrom(fh, false);
-                toast('Cargado el archivo');
+                await loadRemote(remote.file.id, false);
                 return
             }
-            if (r !== 'over') return
+            if (r !== 'over') return;
+            base = await JornadaDrive.read(remote.file.id);
+            if (String(base.file.version) !== String(meta.version)) {
+                throw Error('Drive ha vuelto a cambiar. Revisa de nuevo el conflicto antes de guardar.')
+            }
         }
-        await writeFile()
-    } catch (e) {
-        if (e && e.name === 'NotFoundError') {
-            toast('El archivo ya no existe: elige dónde crearlo de nuevo');
-            await crear()
-        } else toast('No se ha podido guardar en el archivo.')
-    }
-}
-
-async function abrir() {
-    if (dirty) {
-        var r = await modal({
-            title: 'Cambios sin guardar',
-            text: 'Si abres otro archivo perderás los cambios que no has guardado.',
-            actions: [{v: 'no', label: 'Cancelar', cls: 'primary'}, {
-                v: 'go',
-                label: 'Abrir y descartar mis cambios',
-                cls: 'danger'
-            }]
-        });
-        if (r !== 'go') return false
-    }
-    if (!canFS) {
-        $('importFile').click();
-        return true
-    }
-    var h;
-    try {
-        h = (await showOpenFilePicker({types: TYPES, id: 'jornada'}))[0]
-    } catch (e) {
-        if (!(e && e.name === 'AbortError')) toast('No se pudo abrir el selector de archivos.');
-        return false
-    }
-    try {
-        await loadFrom(h, false);
+        var revision = editVersion, text = serialize();
         try {
-            await h.requestPermission({mode: 'readwrite'})
+            remote = await JornadaDrive.write(remote.file.id, text, base)
         } catch (e) {
+            if (e.code !== 'uncertain') throw e;
+            var retry = await modal({
+                title: 'Guardado sin confirmar',
+                text: 'No se puede confirmar si Drive recibió el guardado anterior. Tus cambios siguen pendientes. ' +
+                    'Puedes esperar, o autorizar un nuevo intento que comprobará otra vez el contenido remoto antes de escribir.',
+                actions: [{v: 'cancel', label: 'Esperar y conservar mis cambios', cls: 'primary'},
+                    {v: 'retry', label: 'Comprobar y autorizar otro intento'}]
+            });
+            if (retry !== 'retry') throw e;
+            remote = await JornadaDrive.write(remote.file.id, text, base, {retryUncertain: true})
         }
-        hput(h);
-        toast('Abierto ' + h.name);
-        return true
-    } catch (e) {
-        toast('No se ha podido abrir: archivo no válido.');
-        return false
-    }
+        if (revision === editVersion) {
+            dirty = false;
+            clearDraft()
+        } else persistDraft();
+        toast('Jornada guardada.')
+    }, 'Guardando cambios en Google Drive…').then(function (ok) { return !!ok && !dirty })
 }
 
-var PRIV = '<br><br><b>Privacidad:</b> esta web no tiene servidor ni cuenta. Tus datos no se envian a nadie: se guardan solo en tu archivo y en un borrador temporal de este navegador. Quien publica la pagina no puede verlos. Haz copias de seguridad de tu archivo: si lo pierdes, no hay otra copia.';
-
-async function welcome() {
-    var acts = canFS ? [{v: 'new', label: 'Crear mi archivo de datos', cls: 'primary'}, {
-        v: 'open',
-        label: 'Abrir un archivo que ya tengo'
-    }, {v: 'try', label: 'Probar sin archivo', cls: 'ghost'}] : [{
-        v: 'open',
-        label: 'Abrir mi archivo',
-        cls: 'primary'
-    }, {v: 'try', label: 'Empezar sin archivo', cls: 'ghost'}];
-    var txt = canFS ? 'Tus datos se guardan en un único archivo (<b>' + FNAME + '</b>) con todos los años. Lo eliges una sola vez; si lo pones en una carpeta de Drive, se sincroniza solo.' : 'Este navegador no permite vincular un archivo: Guardar descargará <b>' + FNAME + '</b> y otro día tendrás que abrirlo aquí. Para guardar directamente, usa Chrome o Edge en el ordenador.';
-    var r = await modal({title: 'Control de jornada', text: txt + PRIV, actions: acts});
-    if (r === 'new') {
-        if (!(await crear())) return welcome();
-        return
-    }
-    if (r === 'open') {
-        if (!(await abrir())) return welcome();
-        return
-    }
-    var d = readDraft();
-    if (d) adoptDraft(d)
-}
-
-async function reconnect(msg) {
+async function resolvePending() {
+    endPaint();
+    if (!dirty) return true;
     var r = await modal({
-        title: 'Conectar con tu archivo',
-        text: (msg || '') + 'Para abrir <b>' + esc(fh.name) + '</b> el navegador necesita tu permiso (solo al empezar).',
-        actions: [{v: 'ok', label: 'Conectar', cls: 'primary'}, {
-            v: 'other',
-            label: 'Elegir otro archivo o crear uno nuevo'
-        }]
+        title: 'Cambios sin guardar',
+        text: 'Antes de salir de esta jornada, guarda los cambios en Drive o descártalos expresamente.',
+        actions: [{v: 'cancel', label: 'Seguir con esta jornada', cls: 'primary'},
+            {v: 'save', label: 'Guardar antes de salir'},
+            {v: 'discard', label: 'Descartar y salir', cls: 'danger'}]
     });
-    if (r === 'ok') {
-        try {
-            if ((await fh.requestPermission({mode: 'readwrite'})) === 'granted') {
-                await loadFrom(fh, true);
-                return
-            }
-        } catch (e) {
-        }
-        return reconnect('No se pudo conectar. ')
-    }
-    fh = null;
-    await hput(null);
-    setStatus();
-    return welcome()
+    if (r === 'save') return guardar();
+    if (r !== 'discard' || !clearDraft()) return false;
+    dirty = false;
+    return true
 }
 
-async function init() {
-    var draft = readDraft();
-    fh = await hget();
-    if (fh) {
-        var p = 'prompt';
-        try {
-            p = await fh.queryPermission({mode: 'readwrite'})
-        } catch (e) {
-        }
-        if (p === 'granted') {
-            try {
-                await loadFrom(fh, true)
-            } catch (e) {
-                await reconnect('No se pudo leer el archivo. ')
-            }
-        } else await reconnect();
+async function selectMain() {
+    setProgress('Buscando tu carpeta y jornada en Google Drive…');
+    var files = await JornadaDrive.listMain();
+    if (!files.length) {
+        var choice = await modal({
+            title: 'Crear tu jornada en Drive',
+            text: 'Se creará una carpeta <b>JornadaTuvisa</b> con el archivo nuevo <b>jornada_laboral.json</b> ' +
+                'en tu cuenta de Google Drive. ' +
+                'Se guardarán todos los años en él. No se importarán archivos ni borradores del modo anterior.',
+            actions: [{v: 'new', label: 'Crear archivo nuevo', cls: 'primary'}, {v: 'cancel', label: 'Cancelar'}]
+        });
+        if (choice !== 'new') return;
+        setProgress('Creando tu archivo de jornada en Google Drive…');
+        var created = await JornadaDrive.createMain(JSON.stringify({
+            app: 'jornada-laboral', version: 3, years: {}
+        }));
+        await loadRemote(created.id, true);
         return
     }
-    if (draft) {
-        adoptDraft(draft);
-        return
+    var file = files[0];
+    if (files.length > 1) {
+        var index = await modal({
+            title: 'Hay varias jornadas en Drive',
+            text: 'Elige el archivo principal. No se borrará ninguno.',
+            actions: files.map(function (f, i) {
+                return {v: i, label: esc(f.name) + ' · ' + esc(f.modifiedTime || '') + ' · ' + esc(f.id)}
+            }).concat([{v: 'cancel', label: 'Cancelar', cls: 'primary'}])
+        });
+        if (index === 'cancel') return;
+        file = files[index]
     }
-    await welcome()
+    await loadRemote(file.id, true)
 }
 
+function resetSession() {
+    JornadaDrive.disconnect();
+    account = null;
+    remote = null;
+    DB = {version: 3, years: {}};
+    dirty = false;
+    draftWarning = false;
+    S = yearObj(new Date().getFullYear());
+    $('holidayNickname').value = '';
+    $('holidayJSON').value = '';
+    $('holidayPrompt').value = '';
+    showYear()
+}
+
+async function conectar() {
+    if (busy) return;
+    if (!JornadaDrive.ready()) {
+        toast('Google no está disponible todavía. Comprueba internet o el bloqueo de scripts y vuelve a pulsar Conectar.');
+        return
+    }
+    if (JornadaDrive.connected()) {
+        if (!remote) {
+            await runDrive(selectMain, 'Abriendo tu jornada desde Google Drive…');
+            return
+        }
+        if (dirty) {
+            if (!(await resolvePending())) return;
+            if (!clearDraft()) return;
+            toast('Cambios resueltos. Pulsa Cambiar cuenta para elegir otra.');
+            return
+        }
+        if (!clearDraft()) return;
+        resetSession();
+    }
+    // Keep connect() before any await so the OAuth popup retains the user's gesture.
+    var authorization = JornadaDrive.connect();
+    await runDrive(async function () {
+        var nextAccount = await authorization;
+        if (account && nextAccount.id !== account.id) {
+            JornadaDrive.disconnect();
+            throw Error('Has elegido otra cuenta. Reconecta con la cuenta de esta jornada o desconecta tras resolver tus cambios.')
+        }
+        account = nextAccount;
+        if (remote) {
+            if (!dirty) await loadRemote(remote.file.id, true)
+        } else await selectMain()
+    }, 'Conectando con Google Drive…')
+}
+
+$('connectBtn').onclick = conectar;
+$('disconnectBtn').onclick = async function () {
+    if (busy || !(await resolvePending()) || !clearDraft()) return;
+    resetSession();
+    setStatus()
+};
 $('selBtn').onclick = function () {
-    abrir()
+    if (!remote || busy) return;
+    runDrive(async function () {
+        if (dirty) {
+            var r = await modal({
+                title: 'Recargar desde Drive',
+                text: 'Se descartarán los cambios pendientes solo si se puede leer correctamente el archivo de Drive.',
+                actions: [{v: 'cancel', label: 'Cancelar', cls: 'primary'},
+                    {v: 'load', label: 'Descartar y recargar', cls: 'danger'}]
+            });
+            if (r !== 'load') return
+        }
+        await loadRemote(remote.file.id, false)
+    }, 'Cargando tu jornada desde Google Drive…')
 };
 $('exportBtn').onclick = guardar;
 document.addEventListener('keydown', function (e) {
     if ((e.ctrlKey || e.metaKey) && String(e.key).toLowerCase() === 's') {
         e.preventDefault();
+        if (document.querySelector('dialog[open]')) return;
         guardar()
     }
 });
@@ -625,22 +647,6 @@ window.addEventListener('beforeunload', function (e) {
         e.returnValue = ''
     }
 });
-$('importFile').onchange = async function (e) {
-    var f = e.target.files[0];
-    e.target.value = '';
-    if (!f) return;
-    try {
-        DB = parseDB(await f.text());
-        fh = null;
-        baseMtime = null;
-        dirty = false;
-        clearDraft();
-        showYear();
-        toast('Abierto ' + f.name)
-    } catch (err) {
-        toast('No se ha podido abrir: archivo no válido.')
-    }
-};
 
 function toast(m) {
     var t = $('toast');
@@ -1020,43 +1026,18 @@ $('holidayImport').onclick = function () {
     $('holidayJSON').value = '';
     modal({
         title: 'Importación realizada: ' + items.length + ' fechas',
-        text: '<b>Revisa los datos antes de guardar: la IA puede interpretar mal el PDF y las fechas o los códigos importados pueden no ser correctos.</b> Contrástalos con el documento original, especialmente los grupos, anexos, vacaciones y compensaciones de Gautxori.<br><br>' + esc(details).replace(/\n/g, '<br><br>') + breakdown + '<br>Solo se han aplicado las fechas declaradas. El resto del calendario, la jornada y las horas manuales no se han modificado.<br><br>Los cambios están pendientes de guardar en tu archivo. Corrige lo necesario y pulsa <b>Guardar</b>.',
+        text: '<b>Revisa los datos antes de guardar: la IA puede interpretar mal el PDF y las fechas o los códigos importados pueden no ser correctos.</b> Contrástalos con el documento original, especialmente los grupos, anexos, vacaciones y compensaciones de Gautxori.<br><br>' + esc(details).replace(/\n/g, '<br><br>') + breakdown + '<br>Solo se han aplicado las fechas declaradas. El resto del calendario, la jornada y las horas manuales no se han modificado.<br><br>Los cambios están pendientes de guardar en Google Drive. Corrige lo necesario y pulsa <b>Guardar</b>.',
         actions: [{v: 'ok', label: 'Entendido, revisaré los datos', cls: 'primary'}]
     })
 };
 
 /* ===== Copias de seguridad ===== */
-function stamp() {
-    var d = new Date(), p = function (n) {
-        return ('0' + n).slice(-2)
-    };
-    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + '_' + p(d.getHours()) + p(d.getMinutes())
-}
-
 async function copiaSeguridad() {
-    var name = 'jornada_laboral_copia_' + stamp() + '.json';
-    if (!canFS) {
-        var b = new Blob([serialize()], {type: 'application/json'}), a = document.createElement('a');
-        a.href = URL.createObjectURL(b);
-        a.download = name;
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        setTimeout(function () {
-            URL.revokeObjectURL(a.href)
-        }, 1000);
-        toast('Copia descargada: ' + name);
-        return
-    }
-    try {
-        var h = await showSaveFilePicker({suggestedName: name, types: TYPES, id: 'jornada-copias'}),
-            w = await h.createWritable();
-        await w.write(serialize());
-        await w.close();
-        toast('Copia guardada: ' + h.name)
-    } catch (e) {
-        if (!(e && e.name === 'AbortError')) toast('No se pudo guardar la copia. Prueba con otra carpeta.')
-    }
+    if (!remote || busy) return;
+    await runDrive(async function () {
+        var copy = await JornadaDrive.backup(serialize());
+        toast('Copia de seguridad creada en Google Drive. El guardado principal no ha cambiado.')
+    }, 'Creando una copia de seguridad en Google Drive…')
 }
 
 $('bkBtn').onclick = function () {
@@ -1078,31 +1059,8 @@ $('yNext').onclick = function () {
 };
 
 async function descartar() {
-    if (!dirty) return;
-    var r = await modal({
-        title: 'Descartar cambios',
-        text: fh ? 'Se perderán los cambios que no has guardado y se volverán a cargar los datos de <b>' + esc(fh.name) + '</b>.' : 'Todavía no hay archivo vinculado, así que se borrarán todos los datos de esta sesión.',
-        actions: [{v: 'no', label: 'Cancelar', cls: 'primary'}, {v: 'go', label: 'Descartar cambios', cls: 'danger'}]
-    });
-    if (r !== 'go') return;
-    if (!fh) {
-        DB = {version: 3, years: {}};
-        dirty = false;
-        clearDraft();
-        showYear();
-        toast('Cambios descartados');
-        return
-    }
-    try {
-        if ((await fh.queryPermission({mode: 'readwrite'})) !== 'granted' && (await fh.requestPermission({mode: 'readwrite'})) !== 'granted') {
-            toast('Sin permiso para leer el archivo');
-            return
-        }
-        await loadFrom(fh, false);
-        toast('Cambios descartados: datos recargados del archivo')
-    } catch (e) {
-        toast('No se ha podido recargar el archivo.')
-    }
+    if (!dirty || busy) return;
+    $('selBtn').onclick()
 }
 
 $('discardBtn').onclick = descartar;
@@ -1146,5 +1104,50 @@ document.addEventListener('keydown', function (e) {
         i.classList.remove('open');
         i.querySelector('.ibtn').setAttribute('aria-expanded', 'false')
     })
+});
+async function init() {
+    $('progressDialog').addEventListener('cancel', function (e) { e.preventDefault() });
+    setStatus();
+    var legacy;
+    try {
+        legacy = localStorage.getItem('jornada_draft_v3')
+    } catch (e) {
+        toast('El almacenamiento del navegador no está disponible. Los borradores podrían no conservarse.');
+        return
+    }
+    if (legacy) {
+        var r = await modal({
+            title: 'Borrador del modo anterior',
+            text: 'Existe un borrador local anterior a Drive. No se subirá ni mezclará con la nueva jornada. ' +
+                'Tus archivos JSON anteriores no se modificarán. Puedes conservar este borrador o eliminarlo expresamente.',
+            actions: [{v: 'keep', label: 'Conservar borrador antiguo', cls: 'primary'},
+                {v: 'delete', label: 'Eliminar borrador antiguo', cls: 'danger'}]
+        });
+        if (r === 'delete') {
+            try {
+                localStorage.removeItem('jornada_draft_v3')
+            } catch (e) {
+                toast('No se pudo eliminar el borrador antiguo.')
+            }
+        }
+    }
+}
+
+var lastRemoteCheck = 0;
+document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState !== 'visible' || busy || !remote ||
+        document.querySelector('dialog[open]') ||
+        !JornadaDrive.connected() || Date.now() - lastRemoteCheck < 30000) return;
+    lastRemoteCheck = Date.now();
+    runDrive(async function () {
+        var meta = await JornadaDrive.metadata(remote.file.id);
+        if (String(meta.version) === String(remote.file.version)) return;
+        if (dirty) {
+            toast('Drive tiene cambios de otra sesión. Revisa el conflicto al guardar.')
+        } else await loadRemote(remote.file.id, false)
+    }, 'Comprobando cambios en Google Drive…')
+});
+window.addEventListener('storage', function (e) {
+    if (!e.key || e.key !== draftKey()) return;
 });
 init();

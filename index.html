@@ -39,7 +39,8 @@
             </button>
         </div>
         <div class="actions">
-            <button class="primary" id="exportBtn">Guardar</button>
+            <button type="button" id="connectBtn">Conectar con Google Drive</button>
+            <button class="primary" id="exportBtn" disabled>Guardar</button>
             <button type="button" id="discardBtn" disabled
                     title="Descartar los cambios y recargar los datos del archivo">Descartar cambios
             </button>
@@ -54,16 +55,17 @@
                 </button>
                 <div id="moreMenu" role="menu">
                     <button id="printBtn" type="button" role="menuitem">Imprimir</button>
-                    <button id="bkBtn" type="button" role="menuitem">Generar copia de seguridad</button>
-                    <button id="selBtn" type="button" role="menuitem">Abrir otro archivo…</button>
+                    <button id="bkBtn" type="button" role="menuitem" disabled>Crear copia en Drive</button>
+                    <button id="selBtn" type="button" role="menuitem" disabled>Recargar desde Drive</button>
+                    <button id="disconnectBtn" type="button" role="menuitem" disabled>Desconectar cuenta</button>
                     <hr>
                     <button class="danger" id="resetBtn" type="button" role="menuitem">Restablecer este año</button>
                 </div>
             </div>
-            <input id="importFile" type="file" accept="application/json" hidden></div>
+        </div>
     </div>
 </header>
-<main>
+<main inert>
     <div class="kpis">
         <div class="kpi"><small>Jornada anual</small><strong id="kpiTarget">0</strong><em>días</em></div>
         <div class="kpi"><small>Jornada computada</small><strong id="kpiComputed">0</strong><em>días</em></div>
@@ -112,9 +114,27 @@
             </div>
         </section>
     </div>
-    <p class="note noprint">Tus datos no se envían a ningún servidor: solo se guardan en tu archivo JSON y en un
-        borrador temporal de este navegador. Haz copias de seguridad de tu archivo.</p>
 </main>
+<footer class="note privacy noprint">
+    <p>Tu jornada se guarda al pulsar <b>Guardar</b> en un archivo JSON privado dentro de la carpeta
+        <b>JornadaTuvisa</b> de tu Google Drive.
+        Conecta la misma cuenta en móvil y ordenador. Google puede pedirte reconectar al caducar el permiso.</p>
+    <p><b>Privacidad:</b> esta web envía los datos directamente a Google Drive y conserva un borrador de recuperación
+        de esta sesión en este navegador hasta guardar, descartar o desconectar. Quien publica la web no recibe tus jornadas ni
+        almacena cuentas de usuario. Google procesa la autorización y el almacenamiento; el alojamiento de la web
+        puede mantener registros técnicos de acceso. No se incorpora analítica.</p>
+    <p>Se solicita acceso solo a archivos creados o autorizados para esta aplicación, no a todo tu Drive.
+        Desconectar limpia la sesión local, pero no borra archivos ni revoca el permiso de Google.
+        Puedes revocarlo en <a href="https://myaccount.google.com/connections" target="_blank" rel="noopener noreferrer">las conexiones de tu cuenta de Google</a>.</p>
+    <p>Si editas simultáneamente en dos dispositivos, se comprueban cambios y se conservan copias de recuperación
+        en Drive antes de reemplazar el archivo. Esto no garantiza un bloqueo atómico entre escrituras exactamente
+        simultáneas: evita editar la misma jornada a la vez. No se garantiza el uso sin conexión.</p>
+</footer>
+<dialog id="progressDialog" class="dlg progress-dialog" aria-labelledby="progressTitle" aria-describedby="progressMessage">
+    <h3 id="progressTitle">Un momento</h3>
+    <p id="progressMessage">Conectando con Google Drive…</p>
+    <progress aria-label="Operación en curso"></progress>
+</dialog>
 <dialog id="holidayDialog" class="holiday-dialog" aria-labelledby="holidayTitle">
     <h3 id="holidayTitle">Importar festivos</h3>
     <p>Genera el prompt con tu apodo, cópialo en una IA y adjunta el PDF del calendario. Después pega aquí el JSON de su
@@ -140,6 +160,9 @@
         <button id="holidayClose" type="button">Cancelar</button>
     </div>
 </dialog>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<script src="js/drive-config.js"></script>
+<script src="js/drive.js"></script>
 <script src="js/app.js"></script>
 </body>
 </html>
