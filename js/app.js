@@ -53,6 +53,26 @@ function serialize() {
     return JSON.stringify(o)
 }
 
+function canonicalJSON(value, root) {
+    if (Array.isArray(value)) return value.map(function (item) { return canonicalJSON(item, false) });
+    if (!value || typeof value !== 'object') return value;
+    var result = {};
+    Object.keys(value).sort().forEach(function (key) {
+        if (root && key === 'savedAt') return;
+        result[key] = canonicalJSON(value[key], false)
+    });
+    return result
+}
+
+function sameDocumentContent(a, b) {
+    try {
+        return JSON.stringify(canonicalJSON(JSON.parse(a), true)) ===
+            JSON.stringify(canonicalJSON(JSON.parse(b), true))
+    } catch (e) {
+        return false
+    }
+}
+
 S = yearObj(new Date().getFullYear());
 
 function save() {
@@ -384,12 +404,13 @@ function setProgress(message) {
 async function loadRemote(id, recover) {
     setProgress('Cargando tu jornada desde Google Drive…');
     var next = await JornadaDrive.read(id), db = parseDB(next.text);
-    var d = recover ? readDraft(next) : null, restored = false;
+    var d = recover ? readDraft(next) : null, restored = false,
+        draftConflict = !!(d && String(d.base) !== String(next.file.version));
     if (d) {
         var r = await modal({
             title: 'Cambios sin guardar',
             text: 'Hay un borrador de esta cuenta y archivo (' + esc(new Date(d.t).toLocaleString('es-ES')) + '). ' +
-                (String(d.base) !== String(next.file.version) ?
+                (draftConflict ?
                     '<b>Drive ha cambiado desde ese borrador.</b> Recuperarlo mantendrá el conflicto pendiente hasta que decidas qué guardar.' :
                     'Puedes recuperarlo y revisarlo antes de guardar.'),
             actions: [{v: 'rec', label: 'Recuperar borrador', cls: 'primary'},
@@ -397,7 +418,11 @@ async function loadRemote(id, recover) {
         });
         if (r === 'rec') {
             db = parseDB(d.text);
-            next = {file: Object.assign({}, next.file, {version: d.base}), text: next.text};
+            next = {
+                file: Object.assign({}, next.file, {version: d.base}),
+                text: next.text,
+                knownConflict: draftConflict
+            };
             S.year = d.year >= 2000 && d.year <= 2100 ? d.year : S.year;
             restored = true
         }
@@ -472,44 +497,56 @@ async function guardar() {
     return runDrive(async function () {
         var base = remote, meta = await JornadaDrive.metadata(remote.file.id);
         if (String(meta.version) !== String(remote.file.version)) {
-            var r = await modal({
-                title: 'Drive ha cambiado',
-                text: 'Otra sesión ha modificado el archivo. No se sobrescribirá sin tu permiso. ' +
-                    'Puedes conservar tus cambios pendientes, cargar Drive o reemplazarlo expresamente.',
-                actions: [{v: 'cancel', label: 'Conservar mis cambios sin guardar', cls: 'primary'},
-                    {v: 'load', label: 'Descartar mis cambios y cargar Drive', cls: 'danger'},
-                    {v: 'over', label: 'Sobrescribir Drive con mis cambios', cls: 'danger'}]
-            });
-            if (r === 'load') {
-                await loadRemote(remote.file.id, false);
-                return
-            }
-            if (r !== 'over') return;
-            base = await JornadaDrive.read(remote.file.id);
-            if (String(base.file.version) !== String(meta.version)) {
-                throw Error('Drive ha vuelto a cambiar. Revisa de nuevo el conflicto antes de guardar.')
+            var latest = await JornadaDrive.read(remote.file.id);
+            if (sameDocumentContent(latest.text, remote.text) && !remote.knownConflict) {
+                remote = latest;
+                base = latest
+            } else {
+                var r = await modal({
+                    title: 'Drive ha cambiado',
+                    text: 'Otra sesión ha modificado los datos. No se sobrescribirá sin tu permiso. ' +
+                        'Puedes conservar tus cambios pendientes, cargar Drive o reemplazarlo expresamente.',
+                    actions: [{v: 'cancel', label: 'Conservar mis cambios sin guardar', cls: 'primary'},
+                        {v: 'load', label: 'Descartar mis cambios y cargar Drive', cls: 'danger'},
+                        {v: 'over', label: 'Sobrescribir Drive con mis cambios', cls: 'danger'}]
+                });
+                if (r === 'load') {
+                    await loadRemote(remote.file.id, false);
+                    return
+                }
+                if (r !== 'over') return;
+                base = await JornadaDrive.read(remote.file.id);
+                if (String(base.file.version) !== String(latest.file.version) ||
+                    !sameDocumentContent(base.text, latest.text)) {
+                    throw Error('Drive ha vuelto a cambiar. Revisa de nuevo el conflicto antes de guardar.')
+                }
             }
         }
-        var revision = editVersion, text = serialize();
+        var revision = editVersion, text = serialize(), cleanupWarning = '';
         try {
             remote = await JornadaDrive.write(remote.file.id, text, base)
         } catch (e) {
-            if (e.code !== 'uncertain') throw e;
-            var retry = await modal({
-                title: 'Guardado sin confirmar',
-                text: 'No se puede confirmar si Drive recibió el guardado anterior. Tus cambios siguen pendientes. ' +
-                    'Puedes esperar, o autorizar un nuevo intento que comprobará otra vez el contenido remoto antes de escribir.',
-                actions: [{v: 'cancel', label: 'Esperar y conservar mis cambios', cls: 'primary'},
-                    {v: 'retry', label: 'Comprobar y autorizar otro intento'}]
-            });
-            if (retry !== 'retry') throw e;
-            remote = await JornadaDrive.write(remote.file.id, text, base, {retryUncertain: true})
+            if (e.code === 'cleanup' && e.saved) {
+                remote = e.saved;
+                cleanupWarning = e.message
+            } else {
+                if (e.code !== 'uncertain') throw e;
+                var retry = await modal({
+                    title: 'Guardado sin confirmar',
+                    text: 'No se puede confirmar si Drive recibió el guardado anterior. Tus cambios siguen pendientes. ' +
+                        'Puedes esperar, o autorizar un nuevo intento que comprobará otra vez el contenido remoto antes de escribir.',
+                    actions: [{v: 'cancel', label: 'Esperar y conservar mis cambios', cls: 'primary'},
+                        {v: 'retry', label: 'Comprobar y autorizar otro intento'}]
+                });
+                if (retry !== 'retry') throw e;
+                remote = await JornadaDrive.write(remote.file.id, text, base, {retryUncertain: true})
+            }
         }
         if (revision === editVersion) {
             dirty = false;
             clearDraft()
         } else persistDraft();
-        toast('Jornada guardada.')
+        toast(cleanupWarning || 'Jornada guardada.')
     }, 'Guardando cambios en Google Drive…').then(function (ok) { return !!ok && !dirty })
 }
 
@@ -579,6 +616,7 @@ function resetSession() {
 
 async function conectar() {
     if (busy) return;
+    var selectAccount = false;
     if (!JornadaDrive.ready()) {
         toast('Google no está disponible todavía. Comprueba internet o el bloqueo de scripts y vuelve a pulsar Conectar.');
         return
@@ -596,9 +634,10 @@ async function conectar() {
         }
         if (!clearDraft()) return;
         resetSession();
+        selectAccount = true
     }
     // Keep connect() before any await so the OAuth popup retains the user's gesture.
-    var authorization = JornadaDrive.connect();
+    var authorization = JornadaDrive.connect({selectAccount: selectAccount});
     await runDrive(async function () {
         var nextAccount = await authorization;
         if (account && nextAccount.id !== account.id) {

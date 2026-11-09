@@ -7,6 +7,7 @@
   const FIELDS = 'id,name,version,modifiedTime';
   const APP = 'jornada-laboral';
   const FOLDER_NAME = 'JornadaTuvisa';
+  const RECOVERY_FOLDER_NAME = 'Recuperaciones';
   const FOLDER_MIME = 'application/vnd.google-apps.folder';
   let session = null;
   let generation = 0;
@@ -55,7 +56,7 @@
     if (authorization) authorization.cancel();
   }
 
-  function connect() {
+  function connect(options = {}) {
     if (authorization) return authorization.promise;
     if (!ready()) return Promise.reject(failure('unavailable', 'La biblioteca de Google no está disponible. Comprueba la conexión y vuelve a intentarlo.'));
     if (mutating) return Promise.reject(failure('busy', 'Espera a que termine la operación de Drive antes de cambiar de cuenta.'));
@@ -130,7 +131,7 @@
         }
       });
       // Must remain synchronous with the user's click: do not await before opening GIS.
-      client.requestAccessToken({ prompt: 'select_account' });
+      client.requestAccessToken({ prompt: options.selectAccount ? 'select_account' : '' });
     } catch (error) {
       finish(failure('auth', 'No se ha podido iniciar la autorización de Google.', error));
     }
@@ -220,6 +221,7 @@
     const result = { id: file.id, name: file.name, version: file.version, modifiedTime: file.modifiedTime };
     if (Array.isArray(file.parents)) result.parents = file.parents;
     if (typeof file.mimeType === 'string') result.mimeType = file.mimeType;
+    if (file.appProperties && typeof file.appProperties === 'object') result.appProperties = file.appProperties;
     return result;
   }
 
@@ -254,7 +256,7 @@
       const result = await json(ctx, 'files', {
         q: query,
         spaces: 'drive',
-        fields: 'nextPageToken,incompleteSearch,files(' + FIELDS + ',parents,mimeType)',
+        fields: 'nextPageToken,incompleteSearch,files(' + FIELDS + ',parents,mimeType,appProperties)',
         pageSize: 100,
         pageToken
       });
@@ -271,7 +273,8 @@
 
   async function ensureFolder(ctx) {
     const accountId = ctx.account.id;
-    const cachedId = folderIds.get(accountId);
+    const cacheKey = accountId + ':main';
+    const cachedId = folderIds.get(cacheKey);
     if (cachedId) {
       try {
         const cached = await getMetadata(ctx, cachedId);
@@ -281,7 +284,7 @@
         return cached
       } catch (error) {
         if (error.code !== 'missing') throw error;
-        folderIds.delete(accountId)
+        folderIds.delete(cacheKey)
       }
     }
     const query = "trashed = false and mimeType = '" + FOLDER_MIME +
@@ -298,7 +301,7 @@
     if (folder.name !== FOLDER_NAME || folder.mimeType !== FOLDER_MIME) {
       throw failure('response', 'La carpeta de jornada de Drive no tiene el nombre o tipo esperado.');
     }
-    folderIds.set(accountId, folder.id);
+    folderIds.set(cacheKey, folder.id);
     const appFiles = await listFiles(ctx, "trashed = false and appProperties has { key='app' and value='" + APP + "' }");
     for (const file of appFiles) {
       if (file.id === folder.id || file.mimeType === FOLDER_MIME ||
@@ -309,6 +312,87 @@
       await json(ctx, filePath(file.id), params, { method: 'PATCH' });
     }
     return folder;
+  }
+
+  async function ensureRecoveryFolder(ctx) {
+    const accountId = ctx.account.id;
+    const cacheKey = accountId + ':recovery';
+    const cachedId = folderIds.get(cacheKey);
+    if (cachedId) {
+      try {
+        const cached = await getMetadata(ctx, cachedId);
+        if (cached.name !== RECOVERY_FOLDER_NAME || cached.mimeType !== FOLDER_MIME) {
+          throw failure('response', 'La carpeta de recuperaciones guardada en esta sesión no es válida.');
+        }
+        return cached
+      } catch (error) {
+        if (error.code !== 'missing') throw error;
+        folderIds.delete(cacheKey)
+      }
+    }
+    const query = "trashed = false and mimeType = '" + FOLDER_MIME +
+      "' and appProperties has { key='app' and value='" + APP +
+      "' } and appProperties has { key='role' and value='recovery-folder' }";
+    let folders = await listFiles(ctx, query);
+    if (folders.length > 1) {
+      throw failure('conflict', 'Hay varias carpetas de recuperaciones creadas por esta aplicación. No se moverán archivos automáticamente.');
+    }
+    if (!folders.length) {
+      folders = [await create(ctx, 'recovery-folder', 'recovery-folder', '{}',
+        RECOVERY_FOLDER_NAME, {}, null, FOLDER_MIME)]
+    }
+    const folder = folders[0];
+    if (folder.name !== RECOVERY_FOLDER_NAME || folder.mimeType !== FOLDER_MIME) {
+      throw failure('response', 'La carpeta de recuperaciones de Drive no tiene el nombre o tipo esperado.');
+    }
+    folderIds.set(cacheKey, folder.id);
+    const recoveryFiles = await listFiles(ctx, "trashed = false and appProperties has { key='app' and value='" +
+      APP + "' } and appProperties has { key='role' and value='recovery' }");
+    for (const file of recoveryFiles) {
+      if (file.parents && file.parents.includes(folder.id)) continue;
+      const removeParents = (file.parents || []).filter(parent => parent !== folder.id).join(',');
+      const params = { addParents: folder.id, fields: FIELDS + ',parents,mimeType,appProperties' };
+      if (removeParents) params.removeParents = removeParents;
+      await json(ctx, filePath(file.id), params, { method: 'PATCH' });
+    }
+    return folder;
+  }
+
+  function recoveryQuery(id) {
+    return "trashed = false and appProperties has { key='app' and value='" + APP +
+      "' } and appProperties has { key='role' and value='recovery' } and appProperties has { key='sourceId' and value='" +
+      id + "' }";
+  }
+
+  async function pruneRecoveries(ctx, sourceId, keepId) {
+    let files = await listFiles(ctx, recoveryQuery(sourceId));
+    if (!files.length) return;
+    await ensureRecoveryFolder(ctx);
+    files = await listFiles(ctx, recoveryQuery(sourceId));
+    if (!keepId && files.length) {
+      files.sort((a, b) => b.modifiedTime.localeCompare(a.modifiedTime));
+      keepId = files[0].id;
+    }
+    for (const file of files) {
+      if (file.id === keepId) continue;
+      try {
+        await request(ctx, filePath(file.id), {}, { method: 'DELETE' });
+      } catch (error) {
+        if (error.code !== 'missing') throw error;
+      }
+    }
+  }
+
+  async function cleanupAfterSave(ctx, sourceId, keepId, saved) {
+    try {
+      await pruneRecoveries(ctx, sourceId, keepId);
+    } catch (error) {
+      const warning = failure('cleanup',
+        'La jornada se guardó, pero no se pudieron eliminar todas las recuperaciones antiguas. Se volverá a intentar al próximo guardado.',
+        error);
+      warning.saved = saved;
+      throw warning;
+    }
   }
 
   async function list(ctx) {
@@ -442,7 +526,10 @@
       if (pending) {
         if (remote.text === pending.text) {
           writes.delete(key);
-          if (text === pending.text) return remote;
+          if (text === pending.text) {
+            await cleanupAfterSave(ctx, id, pending.recoveryId, remote);
+            return remote
+          }
           // A later local edit must supply the newly confirmed base, never clear it as saved.
           throw failure('conflict', 'Se ha confirmado el guardado anterior, pero hay otro contenido pendiente. Revisa la versión de Drive antes de guardarlo.');
         }
@@ -462,22 +549,25 @@
       if (remote.file.version !== baseVersion) {
         throw failure('conflict', 'Otra sesión ha cambiado el archivo de Drive. Carga o revisa esa versión antes de reemplazarla.');
       }
-      if (remote.text === text) return remote;
+      if (remote.text === text) {
+        await cleanupAfterSave(ctx, id, null, remote);
+        return remote
+      }
       /*
        * Drive v3 files.update does not document a browser-usable If-Match contract.
        * Do not infer it from an exposed ETag. Preserve remote data, then recheck.
        * This is NOT atomic: another device can write between this check and PATCH.
        * The recovery file protects the observed version, not an unseen racing edit.
        */
-      const folder = await ensureFolder(ctx);
-      await create(ctx, 'recovery:' + id + ':' + remote.file.version, 'recovery', remote.text,
+      const recoveryFolder = await ensureRecoveryFolder(ctx);
+      const recovery = await create(ctx, 'recovery:' + id + ':' + remote.file.version, 'recovery', remote.text,
         'jornada_laboral_recuperacion_' + stamp() + '.json',
-        { sourceId: id, sourceVersion: remote.file.version }, folder.id);
+        { sourceId: id, sourceVersion: remote.file.version }, recoveryFolder.id);
       const latest = await getMetadata(ctx, id);
       if (latest.version !== remote.file.version) {
         throw failure('conflict', 'El archivo ha cambiado mientras se conservaba la copia de recuperación. No se ha reemplazado.');
       }
-      writes.set(key, { text, version: latest.version });
+      writes.set(key, { text, version: latest.version, recoveryId: recovery.id });
       let uploadError = null;
       try {
         await request(ctx, filePath(id), { uploadType: 'media', fields: FIELDS }, {
@@ -501,6 +591,7 @@
       }
       if (remote.text === text) {
         writes.delete(key);
+        await cleanupAfterSave(ctx, id, recovery.id, remote);
         return remote;
       }
       if (remote.file.version !== latest.version) {
