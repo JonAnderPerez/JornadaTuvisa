@@ -476,6 +476,7 @@ async function runDrive(action, message) {
     endPaint();
     menu.style.display = 'none';
     busy = true;
+    var promptReconnect = false;
     progressMessage = message || 'Conectando con Google Drive…';
     setStatus();
     try {
@@ -489,12 +490,13 @@ async function runDrive(action, message) {
                 driveError(recoveryError)
             }
         } else if (e.code === 'silent_auth') {
-            toast('No se pudo reconectar automáticamente. Abre «Más opciones» y pulsa «Reconectar con Drive» para continuar.')
+            promptReconnect = true
         } else driveError(e);
         return false
     } finally {
         busy = false;
-        setStatus()
+        setStatus();
+        if (promptReconnect) openConnectDialog()
     }
 }
 
