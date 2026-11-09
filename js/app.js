@@ -15,6 +15,37 @@ var S = fresh();
 var DB = {version: 3, years: {}}, dirty = false, account = null, remote = null,
     busy = false, editVersion = 0, draftWarning = false,
     draftOwner = Date.now() + ':' + Math.random(), progressMessage = '';
+var ACCOUNT_STORAGE_KEY = 'jornada_drive_account_v1';
+
+function readRememberedAccount() {
+    try {
+        var saved = JSON.parse(localStorage.getItem(ACCOUNT_STORAGE_KEY) || 'null');
+        return saved && typeof saved.id === 'string' && saved.id ?
+            {id: saved.id, email: typeof saved.email === 'string' ? saved.email : ''} : null
+    } catch (e) {
+        toast('No se pudo leer la cuenta de Drive recordada en este navegador.');
+        return null
+    }
+}
+
+function rememberAccount(value) {
+    try {
+        localStorage.setItem(ACCOUNT_STORAGE_KEY, JSON.stringify({
+            id: value.id,
+            email: value.email || ''
+        }))
+    } catch (e) {
+        toast('No se pudo recordar la cuenta en este navegador. Tendrás que elegirla al volver a conectar.')
+    }
+}
+
+function forgetRememberedAccount() {
+    try {
+        localStorage.removeItem(ACCOUNT_STORAGE_KEY)
+    } catch (e) {
+        toast('No se pudo borrar del navegador el recordatorio de la cuenta de Drive.')
+    }
+}
 
 function normalize(o, y) {
     var r = Object.assign(fresh(), o || {});
@@ -345,11 +376,13 @@ function setStatus() {
     var connected = JornadaDrive.connected(), connectBtn = $('connectBtn');
     if (loaded && connected) {
         connectBtn.textContent = 'Cambiar cuenta';
+        connectBtn.title = 'Elegir otra cuenta de Google Drive';
         connectBtn.setAttribute('role', 'menuitem');
         $('moreMenu').insertBefore(connectBtn, $('disconnectBtn'))
     } else {
         connectBtn.textContent = connected ? 'Abrir mi jornada' :
             account ? 'Reconectar con Drive' : 'Conectar con Google Drive';
+        connectBtn.title = account && account.email ? 'Cuenta recordada: ' + account.email : '';
         connectBtn.removeAttribute('role');
         $('exportBtn').parentNode.insertBefore(connectBtn, $('exportBtn'))
     }
@@ -457,6 +490,8 @@ async function runDrive(action, message) {
             } catch (recoveryError) {
                 driveError(recoveryError)
             }
+        } else if (e.code === 'silent_auth') {
+            toast('No se pudo reconectar automáticamente. Pulsa «Reconectar con Drive» para continuar.')
         } else driveError(e);
         return false
     } finally {
@@ -521,6 +556,8 @@ async function guardar() {
                     throw Error('Drive ha vuelto a cambiar. Revisa de nuevo el conflicto antes de guardar.')
                 }
             }
+        } else {
+            base = {file: meta, text: remote.text}
         }
         var revision = editVersion, text = serialize(), cleanupWarning = '';
         try {
@@ -602,6 +639,7 @@ async function selectMain() {
 
 function resetSession() {
     JornadaDrive.disconnect();
+    forgetRememberedAccount();
     account = null;
     remote = null;
     DB = {version: 3, years: {}};
@@ -614,10 +652,11 @@ function resetSession() {
     showYear()
 }
 
-async function conectar() {
+async function conectar(silent) {
     if (busy) return;
     var selectAccount = false;
     if (!JornadaDrive.ready()) {
+        if (silent === true) return false;
         toast('Google no está disponible todavía. Comprueba internet o el bloqueo de scripts y vuelve a pulsar Conectar.');
         return
     }
@@ -636,19 +675,24 @@ async function conectar() {
         resetSession();
         selectAccount = true
     }
-    // Keep connect() before any await so the OAuth popup retains the user's gesture.
-    var authorization = JornadaDrive.connect({selectAccount: selectAccount});
+    // Start interactive authorization before awaiting so its popup keeps the user's gesture.
+    var authorization = JornadaDrive.connect({
+        selectAccount: selectAccount,
+        loginHint: !selectAccount && account ? account.email : '',
+        silent: silent === true
+    });
     await runDrive(async function () {
         var nextAccount = await authorization;
         if (account && nextAccount.id !== account.id) {
             JornadaDrive.disconnect();
-            throw Error('Has elegido otra cuenta. Reconecta con la cuenta de esta jornada o desconecta tras resolver tus cambios.')
+            throw Error('Google ha autorizado una cuenta distinta a la recordada. Usa Cambiar cuenta para elegir otra.')
         }
         account = nextAccount;
+        rememberAccount(account);
         if (remote) {
             if (!dirty) await loadRemote(remote.file.id, true)
         } else await selectMain()
-    }, 'Conectando con Google Drive…')
+    }, silent === true ? 'Restaurando tu sesión de Google Drive…' : 'Conectando con Google Drive…')
 }
 
 $('connectBtn').onclick = conectar;
@@ -1074,9 +1118,9 @@ $('holidayImport').onclick = function () {
 async function copiaSeguridad() {
     if (!remote || busy) return;
     await runDrive(async function () {
-        var copy = await JornadaDrive.backup(serialize());
-        toast('Copia de seguridad creada en Google Drive. El guardado principal no ha cambiado.')
-    }, 'Creando una copia de seguridad en Google Drive…')
+        await JornadaDrive.backup(serialize());
+        toast('Copia de seguridad creada en JornadaTuvisa/Copias de seguridad de Google Drive. El guardado principal no ha cambiado.')
+    }, 'Creando una copia de seguridad en JornadaTuvisa/Copias de seguridad…')
 }
 
 $('bkBtn').onclick = function () {
@@ -1146,6 +1190,7 @@ document.addEventListener('keydown', function (e) {
 });
 async function init() {
     $('progressDialog').addEventListener('cancel', function (e) { e.preventDefault() });
+    account = readRememberedAccount();
     setStatus();
     var legacy;
     try {
@@ -1189,4 +1234,10 @@ document.addEventListener('visibilitychange', function () {
 window.addEventListener('storage', function (e) {
     if (!e.key || e.key !== draftKey()) return;
 });
-init();
+init().then(function () {
+    var restore = function () {
+        if (account && !JornadaDrive.connected()) conectar(true)
+    };
+    if (document.readyState === 'complete') restore();
+    else window.addEventListener('load', restore, {once: true})
+});

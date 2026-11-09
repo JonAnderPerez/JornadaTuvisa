@@ -8,6 +8,7 @@
   const APP = 'jornada-laboral';
   const FOLDER_NAME = 'JornadaTuvisa';
   const RECOVERY_FOLDER_NAME = 'Recuperaciones';
+  const BACKUP_FOLDER_NAME = 'Copias de seguridad';
   const FOLDER_MIME = 'application/vnd.google-apps.folder';
   let session = null;
   let generation = 0;
@@ -86,7 +87,10 @@
         resolveAttempt(account);
       }
     }
-    const timer = setTimeout(() => finish(failure('auth', 'La autorización de Google ha tardado demasiado. Vuelve a pulsar Conectar.')), 120000);
+    const timer = setTimeout(() => finish(failure(options.silent ? 'silent_auth' : 'auth',
+      options.silent ? 'Google no ha restaurado la sesión en segundo plano.' :
+        'La autorización de Google ha tardado demasiado. Vuelve a pulsar Conectar.')),
+    options.silent ? 15000 : 120000);
     try {
       const client = window.google.accounts.oauth2.initTokenClient({
         client_id: clientId,
@@ -95,9 +99,11 @@
         callback: async response => {
           if (authorization !== pending || generation !== attempt) return;
           if (response.error) {
-            finish(failure('auth', response.error === 'access_denied'
-              ? 'No has concedido acceso al archivo de Drive. Tus cambios no se han enviado.'
-              : 'Google no ha autorizado la conexión. Vuelve a intentarlo.'));
+            finish(failure(options.silent ? 'silent_auth' : 'auth',
+              options.silent ? 'No se pudo restaurar la sesión automáticamente.' :
+                response.error === 'access_denied'
+                  ? 'No has concedido acceso al archivo de Drive. Tus cambios no se han enviado.'
+                  : 'Google no ha autorizado la conexión. Vuelve a intentarlo.'));
             return;
           }
           const lifetime = Number(response.expires_in);
@@ -114,9 +120,12 @@
           };
           session = ctx;
           try {
-            const about = await json(ctx, 'about', { fields: 'user(permissionId)' });
+            const about = await json(ctx, 'about', { fields: 'user(permissionId,emailAddress)' });
             if (!about.user?.permissionId) throw failure('auth', 'Drive no ha permitido identificar la cuenta. No se abrirá ningún archivo.');
-            ctx.account = { id: String(about.user.permissionId) };
+            ctx.account = {
+              id: String(about.user.permissionId),
+              email: typeof about.user.emailAddress === 'string' ? about.user.emailAddress : ''
+            };
             finish(null, { ...ctx.account });
           } catch (error) {
             finish(error);
@@ -127,13 +136,23 @@
             popup_closed: 'Has cerrado la ventana de Google sin conectar. Tus cambios siguen pendientes.',
             popup_failed_to_open: 'El navegador ha bloqueado la ventana de Google. Permite ventanas emergentes y pulsa Conectar.'
           };
-          finish(failure('auth', messages[error.type] || 'No se ha podido abrir la autorización de Google. Vuelve a pulsar Conectar.'));
+          finish(failure(options.silent ? 'silent_auth' : 'auth',
+            options.silent ? 'No se pudo restaurar la sesión automáticamente.' :
+              messages[error.type] || 'No se ha podido abrir la autorización de Google. Vuelve a pulsar Conectar.'));
         }
       });
       // Must remain synchronous with the user's click: do not await before opening GIS.
-      client.requestAccessToken({ prompt: options.selectAccount ? 'select_account' : '' });
+      const requestOptions = {
+        prompt: options.selectAccount ? 'select_account' : options.silent ? 'none' : ''
+      };
+      if (!options.selectAccount && typeof options.loginHint === 'string' && options.loginHint) {
+        requestOptions.login_hint = options.loginHint;
+      }
+      client.requestAccessToken(requestOptions);
     } catch (error) {
-      finish(failure('auth', 'No se ha podido iniciar la autorización de Google.', error));
+      finish(failure(options.silent ? 'silent_auth' : 'auth',
+        options.silent ? 'No se pudo restaurar la sesión automáticamente.' :
+          'No se ha podido iniciar la autorización de Google.', error));
     }
     return promise;
   }
@@ -358,17 +377,63 @@
     return folder;
   }
 
+  async function ensureBackupFolder(ctx) {
+    const mainFolder = await ensureFolder(ctx);
+    const cacheKey = ctx.account.id + ':backup-folder';
+    const cachedId = folderIds.get(cacheKey);
+    if (cachedId) {
+      try {
+        const cached = await getMetadata(ctx, cachedId);
+        if (cached.name !== BACKUP_FOLDER_NAME || cached.mimeType !== FOLDER_MIME) {
+          throw failure('response', 'La carpeta de copias de seguridad guardada en esta sesión no es válida.');
+        }
+        if (cached.parents?.includes(mainFolder.id)) return cached;
+        folderIds.delete(cacheKey)
+      } catch (error) {
+        if (error.code !== 'missing') throw error;
+        folderIds.delete(cacheKey)
+      }
+    }
+    const query = "trashed = false and mimeType = '" + FOLDER_MIME + "' and '" + mainFolder.id +
+      "' in parents and appProperties has { key='app' and value='" + APP +
+      "' } and appProperties has { key='role' and value='backup-folder' }";
+    let folders = await listFiles(ctx, query);
+    if (folders.length > 1) {
+      throw failure('conflict', 'Hay varias carpetas de copias de seguridad creadas por esta aplicación. No se moverán archivos automáticamente.');
+    }
+    if (!folders.length) {
+      const created = await create(ctx, 'backup-folder', 'backup-folder', '{}',
+        BACKUP_FOLDER_NAME, {}, mainFolder.id, FOLDER_MIME);
+      folders = [await getMetadata(ctx, created.id)]
+    }
+    const folder = folders[0];
+    if (folder.name !== BACKUP_FOLDER_NAME || folder.mimeType !== FOLDER_MIME ||
+        !folder.parents?.includes(mainFolder.id)) {
+      throw failure('response', 'La carpeta de copias de seguridad no está dentro de JornadaTuvisa.');
+    }
+    folderIds.set(cacheKey, folder.id);
+    const backupFiles = await listFiles(ctx, "trashed = false and appProperties has { key='app' and value='" +
+      APP + "' } and appProperties has { key='role' and value='backup' }");
+    for (const file of backupFiles) {
+      if (file.parents && file.parents.includes(folder.id)) continue;
+      const removeParents = (file.parents || []).filter(parent => parent !== folder.id).join(',');
+      const params = { addParents: folder.id, fields: FIELDS + ',parents,mimeType,appProperties' };
+      if (removeParents) params.removeParents = removeParents;
+      await json(ctx, filePath(file.id), params, { method: 'PATCH' });
+    }
+    return folder
+  }
+
   function recoveryQuery(id) {
     return "trashed = false and appProperties has { key='app' and value='" + APP +
       "' } and appProperties has { key='role' and value='recovery' } and appProperties has { key='sourceId' and value='" +
       id + "' }";
   }
 
-  async function pruneRecoveries(ctx, sourceId, keepId) {
-    let files = await listFiles(ctx, recoveryQuery(sourceId));
+  async function pruneRecoveries(ctx, sourceId, keepId, recoveryFolderReady) {
+    const files = await listFiles(ctx, recoveryQuery(sourceId));
     if (!files.length) return;
-    await ensureRecoveryFolder(ctx);
-    files = await listFiles(ctx, recoveryQuery(sourceId));
+    if (!recoveryFolderReady) await ensureRecoveryFolder(ctx);
     if (!keepId && files.length) {
       files.sort((a, b) => b.modifiedTime.localeCompare(a.modifiedTime));
       keepId = files[0].id;
@@ -383,9 +448,9 @@
     }
   }
 
-  async function cleanupAfterSave(ctx, sourceId, keepId, saved) {
+  async function cleanupAfterSave(ctx, sourceId, keepId, saved, recoveryFolder) {
     try {
-      await pruneRecoveries(ctx, sourceId, keepId);
+      await pruneRecoveries(ctx, sourceId, keepId, !!recoveryFolder);
     } catch (error) {
       const warning = failure('cleanup',
         'La jornada se guardó, pero no se pudieron eliminar todas las recuperaciones antiguas. Se volverá a intentar al próximo guardado.',
@@ -463,23 +528,27 @@
       }
     }
     operation.attempted = true;
+    let result;
     try {
       if (mimeType === FOLDER_MIME) {
-        await json(ctx, 'files', { fields: FIELDS }, {
+        result = fileMetadata(await json(ctx, 'files', { fields: FIELDS + ',mimeType' }, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json; charset=UTF-8' },
           body: JSON.stringify(operation.metadata)
-        });
+        }));
       } else {
         const boundary = 'jornada_' + window.crypto.randomUUID().replace(/-/g, '');
         const body = '--' + boundary + '\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n' +
           JSON.stringify(operation.metadata) + '\r\n--' + boundary +
           '\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n' + text + '\r\n--' + boundary + '--\r\n';
-        await request(ctx, 'files', { uploadType: 'multipart', fields: FIELDS }, {
+        result = fileMetadata(await json(ctx, 'files', { uploadType: 'multipart', fields: FIELDS }, {
           method: 'POST',
           headers: { 'Content-Type': 'multipart/related; boundary=' + boundary },
           body
-        }, true);
+        }, true));
+      }
+      if (result.id !== operation.metadata.id) {
+        throw failure('response', 'Drive ha devuelto un identificador distinto al archivo creado.');
       }
     } catch (error) {
       if (!['network', 'remote', 'response', 'conflict'].includes(error.code)) {
@@ -493,7 +562,8 @@
         throw failure('uncertain', 'No se ha confirmado la creación en Drive. Se conserva el identificador reservado para no crear duplicados al reintentar.', error);
       }
     }
-    return confirm();
+    creations.delete(key);
+    return result;
   }
 
   function stamp() {
@@ -516,13 +586,14 @@
   async function write(id, text, base, options = {}) {
     return exclusive(async ctx => {
       validateText(text);
-      if (base?.file?.id !== id || typeof base.file.version !== 'string') {
+      if (base?.file?.id !== id || typeof base.file.version !== 'string' ||
+          typeof base.text !== 'string') {
         throw failure('conflict', 'Falta la versión de Drive desde la que estás editando. Vuelve a cargar el archivo sin descartar tu borrador.');
       }
       const baseVersion = base.file.version;
       const key = ctx.account.id + ':' + id;
       const pending = writes.get(key);
-      let remote = await snapshot(ctx, id);
+      let remote = pending ? await snapshot(ctx, id) : base;
       if (pending) {
         if (remote.text === pending.text) {
           writes.delete(key);
@@ -550,6 +621,11 @@
         throw failure('conflict', 'Otra sesión ha cambiado el archivo de Drive. Carga o revisa esa versión antes de reemplazarla.');
       }
       if (remote.text === text) {
+        const latest = await getMetadata(ctx, id);
+        if (latest.version !== remote.file.version) {
+          throw failure('conflict', 'Otra sesión ha cambiado el archivo de Drive. Carga o revisa esa versión antes de reemplazarla.');
+        }
+        remote = { file: latest, text: remote.text };
         await cleanupAfterSave(ctx, id, null, remote);
         return remote
       }
@@ -569,12 +645,16 @@
       }
       writes.set(key, { text, version: latest.version, recoveryId: recovery.id });
       let uploadError = null;
+      let uploaded = null;
       try {
-        await request(ctx, filePath(id), { uploadType: 'media', fields: FIELDS }, {
+        uploaded = fileMetadata(await json(ctx, filePath(id), { uploadType: 'media', fields: FIELDS }, {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json; charset=UTF-8' },
           body: text
-        }, true);
+        }, true));
+        if (uploaded.id !== id) {
+          throw failure('response', 'Drive ha devuelto un identificador distinto al archivo actualizado.');
+        }
       } catch (error) {
         uploadError = error;
         if (error.status && error.status < 500) {
@@ -584,14 +664,17 @@
         }
       }
       try {
-        remote = await snapshot(ctx, id);
+        const current = uploadError ? null : await getMetadata(ctx, id);
+        if (uploadError) remote = await snapshot(ctx, id);
+        else if (current.version === uploaded.version) remote = { file: current, text };
+        else remote = await snapshot(ctx, id);
       } catch (error) {
         throw failure(error.code === 'auth' ? 'auth' : 'uncertain',
           'No se ha podido verificar el guardado. Conserva tus cambios y vuelve a comprobar Drive antes de guardar de nuevo.', error);
       }
       if (remote.text === text) {
         writes.delete(key);
-        await cleanupAfterSave(ctx, id, recovery.id, remote);
+        await cleanupAfterSave(ctx, id, recovery.id, remote, recoveryFolder);
         return remote;
       }
       if (remote.file.version !== latest.version) {
@@ -613,7 +696,7 @@
     metadata: async id => getMetadata(current(), id),
     write,
     backup: text => exclusive(async ctx => {
-      const folder = await ensureFolder(ctx);
+      const folder = await ensureBackupFolder(ctx);
       return create(ctx, 'backup', 'backup', text, 'jornada_laboral_copia_' + stamp() + '.json', {}, folder.id);
     })
   });
